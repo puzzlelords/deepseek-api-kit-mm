@@ -1,13 +1,15 @@
 from fastapi import Request as FastAPIRequest
 from fastapi_offline import FastAPIOffline
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Union, Dict, Any
-import time, json, os
+import time, json, os, uuid
 from datetime import datetime
 from common.api import DeepSeekAPI
 from common.config import DEEPSEEK_API_KEY
+from .session_store import SessionStore
 
 app = FastAPIOffline()
 
@@ -22,21 +24,7 @@ app.add_middleware(
 
 api = DeepSeekAPI(DEEPSEEK_API_KEY)
 
-_sessions: Dict[str, dict] = {}
-
-def get_session(session_id: Optional[str]) -> dict:
-    """Get existing session or create a new one."""
-    sid = session_id or "default_local_user"
-    if sid not in _sessions:
-        chat_id = api.create_chat_session()
-        _sessions[sid] = {
-            "chat_id": chat_id,
-            "last_message_id": None,
-            "thinking_enabled": True,
-            "search_enabled": False,
-            "last_message_preview": None,
-        }
-    return _sessions[sid]
+session_store = SessionStore("./deepseek_chat/sessions.json", api)
 
 # ---------- Models ----------
 class ContentPart(BaseModel):
@@ -48,16 +36,16 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     model_config = {"extra": "ignore"}
-
+    
     messages: List[Message]
     stream: Optional[bool] = False
-    session_id: Optional[str] = None
 
+    session_id: Optional[str] = None
 class SessionSettings(BaseModel):
     model_config = {"extra": "ignore"}
-
-    thinking_enabled: Optional[bool] = None
-    search_enabled: Optional[bool] = None
+    
+    thinking_enabled:Optional[bool]=None
+    search_enabled:Optional[bool]=None
 
 class SessionInfo(BaseModel):
     session_id: str
@@ -65,7 +53,6 @@ class SessionInfo(BaseModel):
     thinking_enabled: bool
     search_enabled: bool
     last_message_preview: Optional[str] = None
-
 # ---------- Helper ----------
 def extract_content(content: Union[str, List[ContentPart]]) -> str:
     if isinstance(content, str):
@@ -73,12 +60,16 @@ def extract_content(content: Union[str, List[ContentPart]]) -> str:
     return "\n".join(part.text or "" for part in content if part.type == "text")
 
 def messages_to_chat(messages: List[Message]) -> str:
-    """Extract last user message (history preserved via parent_message_id)."""
+    """برگرداندن آخرین پیام کاربر (تاریخچه از طریق parent_message_id حفظ می‌شود)"""
     if messages:
         return extract_content(messages[-1].content)
     return ""
 
-# ---------- Middleware for logging ----------
+def get_session(session_id: Optional[str]) -> dict:
+    sid = session_id or "default_local_user"
+    return session_store.get(sid)
+
+# ---------- Middleware برای لاگ ----------
 @app.middleware("http")
 async def log_time(request: FastAPIRequest, call_next):
     start = datetime.now()
@@ -98,111 +89,132 @@ async def list_sessions():
             search_enabled=session["search_enabled"],
             last_message_preview=session.get("last_message_preview")
         )
-        for sid, session in _sessions.items()
+        for sid, session in session_store.list_all().items()
     ]
 
 @app.patch("/v1/sessions/{session_id}/settings")
 async def update_session_settings(session_id: str, settings: SessionSettings):
     session = get_session(session_id)
+    updates = {}
     if settings.thinking_enabled is not None:
-        session["thinking_enabled"] = settings.thinking_enabled
+        updates["thinking_enabled"] = settings.thinking_enabled
     if settings.search_enabled is not None:
-        session["search_enabled"] = settings.search_enabled
+        updates["search_enabled"] = settings.search_enabled
+    if updates:
+        session.update(updates)
+        session_store.update(session_id, updates)
     return {"status": "updated", "session_id": session_id}
 
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(session_id: str):
-    if session_id in _sessions:
-        del _sessions[session_id]
+    if session_store.delete(session_id):
         return {"status": "deleted"}
     return {"status": "not_found"}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
     sid = request.session_id or "default_local_user"
-    session = get_session(sid)
+    session = session_store.get(sid)
     chat_id = session["chat_id"]
     parent_message_id = session.get("last_message_id")
-
-    prompt = messages_to_chat(request.messages)
-
-    thinking = session.get("thinking_enabled")
-    search = session.get("search_enabled")
-
+    
+    prompt=messages_to_chat(request.messages)
+    
+    thinking=session.get('thinking_enabled')
+    search=session.get("search_enabled")
+    
     if request.stream:
         def generate():
             new_message_id = None
             full_response = ""
-
+            
+            # ارسال به API با کل history
             for chunk in api.chat_completion(
-                chat_id,
-                prompt,
+                chat_id, 
+                prompt,  # کل messages به صورت prompt
                 parent_message_id=parent_message_id,
                 thinking_enabled=thinking,
                 search_enabled=search
             ):
                 chunk_type = chunk.get("type")
                 msg_id = chunk.get("response_message_id")
-
+                
                 if msg_id and not new_message_id:
                     new_message_id = msg_id
-
-                if chunk_type == "thinking":
+                
+                if chunk_type == 'thinking':
+                    # ارسال thinking به عنوان reasoning_content (طبق استاندارد OpenAI)
                     delta = {"reasoning_content": chunk.get("delta", "")}
-                elif chunk_type == "content":
+                elif chunk_type == 'content':
                     delta_text = chunk.get("delta", "")
                     full_response += delta_text
                     delta = {"content": delta_text}
-                elif chunk_type == "finished":
+                elif chunk_type == 'finished':
+                    # پایان جریان، بعداً final chunk ارسال می‌شود
+                    # اما در finished ممکن است response_message_id نهایی باشد
                     if chunk.get("response_message_id"):
                         new_message_id = chunk["response_message_id"]
-                    break
+                    break  # خروج از حلقه برای ارسال final chunk
                 else:
-                    continue
-
-                yield f"data: {json.dumps(delta)}\n\n"
+                    continue  # نوع ناشناخته، نادیده بگیر
+                
+                response_chunk = delta
+                yield f"data: {json.dumps(response_chunk)}\n\n"
 
             if new_message_id or full_response:
+                updates = {}
                 if new_message_id:
                     session["last_message_id"] = new_message_id
+                    updates["last_message_id"] = new_message_id
                 if full_response:
-                    session["last_message_preview"] = full_response.strip().split("\n")[0][:100]
-
-            yield f"data: {json.dumps({})}\n\n"
+                    preview = full_response.strip().split('\n')[0][:100]
+                    session["last_message_preview"] = preview
+                    updates["last_message_preview"] = preview
+                session_store.update(sid, updates)
+            
+            final_chunk = {}
+            yield f"data: {json.dumps(final_chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
-    # Non-streaming mode
+    # حالت غیر-استریم
     full_text = ""
     full_thinking = ""
     new_message_id = None
-
+    
     for chunk in api.chat_completion(
-        chat_id,
-        prompt,
+        chat_id, 
+        prompt,  # کل messages
         parent_message_id=parent_message_id,
         thinking_enabled=thinking,
         search_enabled=search
     ):
         chunk_type = chunk.get("type")
         msg_id = chunk.get("response_message_id")
-
+        
         if msg_id and not new_message_id:
             new_message_id = msg_id
-
-        if chunk_type == "content":
+            
+        if chunk_type == 'content':
             full_text += chunk.get("delta", "")
-        elif chunk_type == "thinking":
+        elif chunk_type == 'thinking':
             full_thinking += chunk.get("delta", "")
-        elif chunk_type == "finished":
+        elif chunk_type == 'finished':
+            # در finished ممکن است response_message_id نهایی باشد
             if chunk.get("response_message_id"):
                 new_message_id = chunk["response_message_id"]
             break
 
-    if new_message_id:
-        session["last_message_id"] = new_message_id
-    if full_text:
-        session["last_message_preview"] = full_text.strip().split("\n")[0][:100]
+    if new_message_id or full_text:
+        updates = {}
+        if new_message_id:
+            session["last_message_id"] = new_message_id
+            updates["last_message_id"] = new_message_id
+        if full_text:
+            preview = full_text.strip().split('\n')[0][:100]
+            session["last_message_preview"] = preview
+            updates["last_message_preview"] = preview
+        session_store.update(sid, updates)
 
     return {"content": full_text, "reasoning_content": full_thinking}
